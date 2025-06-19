@@ -1,42 +1,46 @@
 import click
 import llm
-from llm.default_plugins.openai_models import Chat, AsyncChat
+import sys
 from pathlib import Path
-from pydantic import Field, field_validator
-from typing import Optional, Union
+from pydantic import ConfigDict, Field, field_validator
+from typing import Optional, Union, Dict, Any, List
 import json
 import time
 import httpx
 
-
-def get_openrouter_models():
-    models = fetch_cached_json(
-        url="https://openrouter.ai/api/v1/models",
-        path=llm.user_dir() / "openrouter_models.json",
-        cache_timeout=3600,
-    )["data"]
-    schema_supporting_ids = {
-        model["id"]
-        for model in fetch_cached_json(
-            url="https://openrouter.ai/api/v1/models?supported_parameters=structured_outputs",
-            path=llm.user_dir() / "openrouter_models_structured_outputs.json",
-            cache_timeout=3600,
-        )["data"]
-    }
-    # Annotate models with their schema support
-    for model in models:
-        model["supports_schema"] = model["id"] in schema_supporting_ids
-    return models
-
+# Import correct base classes from default plugins
+from llm.default_plugins.openai_models import Chat, AsyncChat
 
 class _mixin:
+    _saved_options: Optional[Dict[str, Any]] = None # Keep structure, but won't be used
+
+    # Simplified __init__ needed by base classes if necessary
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_options = {}
+
+
+    # Inherit from Chat.Options now, as per working pattern
     class Options(Chat.Options):
+        model_config = ConfigDict(extra="allow") # Should allow unknown options
+
+        # Caching options (for OpenRouter platform caching, but define)
+        cache_mode: Optional[str] = Field(
+            description="OpenRouter cache mode (e.g., semantic)",
+            default=None
+        )
+        cache_max_age_seconds: Optional[int] = Field(
+            description="OpenRouter cache lifetime in seconds",
+            default=None
+        )
+
+        # Existing OpenRouter options
         online: Optional[bool] = Field(
             description="Use relevant search results from Exa",
             default=None,
         )
         provider: Optional[Union[dict, str]] = Field(
-            description=("JSON object to control provider routing"),
+            description="JSON object to control provider routing",
             default=None,
         )
 
@@ -44,7 +48,6 @@ class _mixin:
         def validate_provider(cls, provider):
             if provider is None:
                 return None
-
             if isinstance(provider, str):
                 try:
                     return json.loads(provider)
@@ -52,206 +55,176 @@ class _mixin:
                     raise ValueError("Invalid JSON in provider string")
             return provider
 
+    # CORRECTED & REVISED build_kwargs logic (Access model_id via self.model_id)
     def build_kwargs(self, prompt, stream):
         kwargs = super().build_kwargs(prompt, stream)
-        kwargs.pop("provider", None)
-        kwargs.pop("online", None)
-        extra_body = {}
-        if prompt.options.online:
-            extra_body["plugins"] = [{"id": "web"}]
-        if prompt.options.provider:
-            extra_body["provider"] = prompt.options.provider
+
+        # Get the model ID using self.model_id (Corrected access)
+        model_id = self.model_id
+
+        # Check if it's an Anthropic model by prefix
+        is_anthropic = model_id.startswith('openrouter/anthropic/')
+
+        # Define the cache breakpoint marker
+        CACHE_MARKER = "--- CACHE BREAKPOINT ---"
+
+        extra_body = kwargs.get('extra_body', {})
+        options = prompt.options # Get options from prompt (CLI/alias)
+
+        # Add OpenRouter-specific parameters (like online, provider) to extra_body
+        openrouter_params_in_extra_body = ['online', 'provider']
+        for key in openrouter_params_in_extra_body:
+            value = getattr(options, key, None)
+            if value is not None:
+                 if key == 'online':
+                      extra_body['plugins'] = [{'id': 'web'}]
+                 elif key == 'provider':
+                      provider_val = value
+                      if isinstance(provider_val, str):
+                          try:
+                              provider_val = json.loads(provider_val)
+                          except json.JSONDecodeError:
+                               print(f"Warning: Could not parse {key} JSON string from options: {provider_val}", file=sys.stderr)
+                               provider_val = None
+                      if provider_val is not None:
+                           extra_body['provider'] = provider_val
+
+        # Handle Anthropic native caching only if it's an Anthropic model
+        # Modify the existing messages structure from prompt.messages
+        if is_anthropic and isinstance(prompt.messages, list): # Ensure messages is a list
+             original_messages = prompt.messages
+
+             new_messages = []
+
+             for message in original_messages:
+                  new_content = []
+                  # Check if message content is a list of content blocks
+                  if isinstance(message.get('content'), list):
+                      for content_block in message['content']:
+                           # Process only text blocks
+                           if content_block.get('type') == 'text' and isinstance(content_block.get('text'), str):
+                                # Split this text block by the marker
+                                text_segments = content_block['text'].split(CACHE_MARKER)
+
+                                # Add segments to new_content, adding cache_control to segments after the first
+                                for i, segment in enumerate(text_segments):
+                                     if not segment.strip(): continue # Skip empty segments
+
+                                     segment_block = {"type": "text", "text": segment.strip()}
+                                     # Add cache_control to segments > 0 (those that followed a marker)
+                                     if i > 0:
+                                         segment_block["cache_control"] = {"type": "ephemeral"} # Using ephemeral as in example
+                                     new_content.append(segment_block)
+
+                           else:
+                                # Keep non-text content blocks as they are (e.g., image_url)
+                                new_content.append(content_block)
+                  # If content is a single string
+                  elif isinstance(message.get('content'), str):
+                      # Split the single string content by marker
+                      text_segments = message['content'].split(CACHE_MARKER)
+
+                      # Add segments to new_content, adding cache_control to segments after the first
+                      for i, segment in enumerate(text_segments):
+                           if not segment.strip(): continue # Skip empty segments
+
+                           segment_block = {"type": "text", "text": segment.strip()}
+                           # Add cache_control to segments > 0 (those that followed a marker)
+                           if i > 0:
+                                segment_block["cache_control"] = {"type": "ephemeral"} # Using ephemeral as in example
+                           new_content.append(segment_block)
+
+                  # If content is neither list nor string, keep original content
+                  else:
+                       new_content = message.get('content')
+
+
+                  # Add the message with potentially modified content to new_messages
+                  new_message = message.copy()
+                  new_message['content'] = new_content
+                  new_messages.append(new_message)
+
+
+             # Replace the original messages in kwargs with our new structure if Anthropic
+             if new_messages: # Ensure our processing resulted in messages
+                  kwargs['messages'] = new_messages
+             # If original_messages was a list but our processing resulted in empty new_messages (e.g., all parts were empty)
+             elif isinstance(prompt.messages, list):
+                  kwargs['messages'] = new_messages
+
+
+        # Update extra_body in kwargs
         if extra_body:
-            kwargs["extra_body"] = extra_body
-        return kwargs
+            kwargs['extra_body'] = extra_body
+        else:
+            kwargs.pop('extra_body', None) # Remove if empty
 
 
+        # Keep debug prints
+        print("--- Debug: build_kwargs: Model ID:", model_id, "Is Anthropic:", is_anthropic, file=sys.stderr)
+        print("--- Debug: build_kwargs: prompt.options contents:", file=sys.stderr)
+        try:
+            print(options.model_dump_json(exclude_none=True), file=sys.stderr)
+        except Exception as e:
+            print(f"Could not dump prompt.options as JSON: {e}. Trying vars()", file=sys.stderr)
+            print(vars(options), file=sys.stderr)
+        print("--- End Debug: prompt.options ---", file=sys.stderr)
+        print("--- Debug: build_kwargs: extra_body contents:", file=sys.stderr)
+        print(json.dumps(extra_body), file=sys.stderr)
+        print("--- Debug: build_kwargs: Final messages structure:", file=sys.stderr)
+        print(json.dumps(kwargs.get('messages'), indent=2), file=sys.stderr) # Pretty print messages
+        print("--- End Debug: Final messages ---", file=sys.stderr)
+
+        return kwargs # Return the modified kwargs dictionary
+
+
+# Define Chat and AsyncChat classes
 class OpenRouterChat(_mixin, Chat):
     needs_key = "openrouter"
     key_env_var = "OPENROUTER_KEY"
+    Options = _mixin.Options # Explicitly attach
 
     def __str__(self):
         return "OpenRouter: {}".format(self.model_id)
-
 
 class OpenRouterAsyncChat(_mixin, AsyncChat):
     needs_key = "openrouter"
     key_env_var = "OPENROUTER_KEY"
+    Options = _mixin.Options # Explicitly attach
 
     def __str__(self):
         return "OpenRouter: {}".format(self.model_id)
 
 
+# Helper function (minimal) for register_models
+def get_openrouter_models_minimal():
+     return [
+          {"id": "anthropic/claude-3-haiku", "name": "Claude 3 Haiku", "context_length": 200000, "supports_schema": False, "pricing": {}},
+          {"id": "google/gemini-pro-1.5", "name": "Gemini 1.5 Pro", "context_length": 1000000, "supports_schema": True, "pricing": {}}
+     ]
+
 @llm.hookimpl
 def register_models(register):
-    # Only do this if the openrouter key is set
     key = llm.get_key("", "openrouter", "OPENROUTER_KEY")
     if not key:
         return
-    for model_definition in get_openrouter_models():
-        supports_images = get_supports_images(model_definition)
+
+    for model_definition in get_openrouter_models_minimal():
         kwargs = dict(
             model_id="openrouter/{}".format(model_definition["id"]),
             model_name=model_definition["id"],
-            vision=supports_images,
+            vision=False, # Simplified
             supports_schema=model_definition["supports_schema"],
             api_base="https://openrouter.ai/api/v1",
             headers={"HTTP-Referer": "https://llm.datasette.io/", "X-Title": "LLM"},
         )
+
+        chat_model = OpenRouterChat(**kwargs)
+        async_chat_model = OpenRouterAsyncChat(**kwargs)
         register(
-            OpenRouterChat(**kwargs),
-            OpenRouterAsyncChat(**kwargs),
+            chat_model,
+            async_chat_model,
         )
 
+# Exclude register_commands hook
 
-class DownloadError(Exception):
-    pass
-
-
-def fetch_cached_json(url, path, cache_timeout):
-    path = Path(path)
-
-    # Create directories if not exist
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if path.is_file():
-        # Get the file's modification time
-        mod_time = path.stat().st_mtime
-        # Check if it's more than the cache_timeout old
-        if time.time() - mod_time < cache_timeout:
-            # If not, load the file
-            with open(path, "r") as file:
-                return json.load(file)
-
-    # Try to download the data
-    try:
-        response = httpx.get(url, follow_redirects=True)
-        response.raise_for_status()  # This will raise an HTTPError if the request fails
-
-        # If successful, write to the file
-        with open(path, "w") as file:
-            json.dump(response.json(), file)
-
-        return response.json()
-    except httpx.HTTPError:
-        # If there's an existing file, load it
-        if path.is_file():
-            with open(path, "r") as file:
-                return json.load(file)
-        else:
-            # If not, raise an error
-            raise DownloadError(
-                f"Failed to download data and no cache is available at {path}"
-            )
-
-
-def get_supports_images(model_definition):
-    try:
-        # e.g. `text->text` or `text+image->text`
-        modality = model_definition["architecture"]["modality"]
-
-        input_modalities = modality.split("->")[0].split("+")
-        return "image" in input_modalities
-    except Exception:
-        return False
-
-
-@llm.hookimpl
-def register_commands(cli):
-    @cli.group()
-    def openrouter():
-        "Commands relating to the llm-openrouter plugin"
-
-    @openrouter.command()
-    @click.option("--free", is_flag=True, help="List free models")
-    @click.option("json_", "--json", is_flag=True, help="Output as JSON")
-    def models(free, json_):
-        "List of OpenRouter models"
-        if free:
-            all_models = [
-                model
-                for model in get_openrouter_models()
-                if model["id"].endswith(":free")
-            ]
-        else:
-            all_models = get_openrouter_models()
-        if json_:
-            click.echo(json.dumps(all_models, indent=2))
-        else:
-            # Custom format
-            for model in all_models:
-                bits = []
-                bits.append(f"- id: {model['id']}")
-                bits.append(f"  name: {model['name']}")
-                bits.append(f"  context_length: {model['context_length']:,}")
-                architecture = model.get("architecture", None)
-                if architecture:
-                    bits.append("  architecture:")
-                    for key, value in architecture.items():
-                        bits.append(
-                            "    "
-                            + key
-                            + ": "
-                            + (value if isinstance(value, str) else json.dumps(value))
-                        )
-                bits.append(f"  supports_schema: {model['supports_schema']}")
-                pricing = format_pricing(model["pricing"])
-                if pricing:
-                    bits.append("  pricing: " + pricing)
-                click.echo("\n".join(bits) + "\n")
-
-    @openrouter.command()
-    @click.option("--key", help="Key to inspect")
-    def key(key):
-        "View information and rate limits for the current key"
-        key = llm.get_key(key, "openrouter", "OPENROUTER_KEY")
-        response = httpx.get(
-            "https://openrouter.ai/api/v1/auth/key",
-            headers={"Authorization": f"Bearer {key}"},
-        )
-        response.raise_for_status()
-        click.echo(json.dumps(response.json()["data"], indent=2))
-
-
-def format_price(key, price_str):
-    """Format a price value with appropriate scaling and no trailing zeros."""
-    price = float(price_str)
-
-    if price == 0:
-        return None
-
-    # Determine scale based on magnitude
-    if price < 0.0001:
-        scale = 1000000
-        suffix = "/M"
-    elif price < 0.001:
-        scale = 1000
-        suffix = "/K"
-    elif price < 1:
-        scale = 1000
-        suffix = "/K"
-    else:
-        scale = 1
-        suffix = ""
-
-    # Scale the price
-    scaled_price = price * scale
-
-    # Format without trailing zeros
-    # Convert to string and remove trailing .0
-    price_str = (
-        f"{scaled_price:.10f}".rstrip("0").rstrip(".")
-        if "." in f"{scaled_price:.10f}"
-        else f"{scaled_price:.0f}"
-    )
-
-    return f"{key} ${price_str}{suffix}"
-
-
-def format_pricing(pricing_dict):
-    formatted_parts = []
-    for key, value in pricing_dict.items():
-        formatted_price = format_price(key, value)
-        if formatted_price:
-            formatted_parts.append(formatted_price)
-    return ", ".join(formatted_parts)

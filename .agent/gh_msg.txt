@@ -1,0 +1,17 @@
+Completed the implementation of **Anthropic native prompt caching** using the `--- CACHE BREAKPOINT ---` marker on the `feature/anthropic-caching` branch.
+
+- Modified the `build_kwargs` method to detect Anthropic models.
+- For Anthropic models, `build_kwargs` now splits the raw prompt text input by the `--- CACHE BREAKPOINT ---` marker.
+- It constructs a multipart message structure where text blocks *following* a breakpoint marker have `{"cache_control": {"type": "ephemeral"}}` added to them within the message content.
+
+The plugin loads correctly with these changes.
+
+Next step is the **functional caching test for Anthropic** using the marker:
+
+1. Create a file with content including the `--- CACHE BREAKPOINT ---` marker.
+2. Pipe this file's content as input to `llm --log -m openrouter/anthropic/claude-3-haiku`.
+3. Query the latest log entry (`$(llm logs path)` -> `responses` table) and examine the `response_json` to verify that the outgoing message structure includes the `cache_control` object in the appropriate text block(s).
+
+If the `cache_control` object is correctly added to the message structure, the implementation part for Anthropic native caching is complete, and we can proceed to verify actual caching usage and then add Gemini support.
+
+I will execute this test next and report the extracted message structure from the log.

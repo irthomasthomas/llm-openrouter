@@ -1,0 +1,147 @@
+import click
+import llm
+import sys
+from pathlib import Path
+from pydantic import ConfigDict, Field, field_validator
+from typing import Optional, Union, Dict, Any, List
+import json
+import time
+import httpx
+
+# Import correct base classes from default plugins
+from llm.default_plugins.openai_models import Chat, AsyncChat
+
+# Minimal structure for caching only, inheriting from llm.Options
+class _mixin:
+    # Removed _saved_options and __init__ as saved aliases are out for this test
+    # Keeping a simplified __init__ needed by base classes if necessary, but no saved_options loading
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Removed self._saved_options = saved_options or {}
+
+    # Inherit from Chat.Options now, as per working pattern
+    class Options(Chat.Options):
+        model_config = ConfigDict(extra="allow") # Should allow unknown options at this level
+
+        # Only caching options for this caching-only implementation
+        cache_mode: Optional[str] = Field(
+            description="Cache mode (e.g., semantic)",
+            default=None
+        )
+        cache_max_age_seconds: Optional[int] = Field(
+            description="Cache lifetime in seconds",
+            default=None
+        )
+        # Exclude online and provider fields for this minimal test
+
+    def build_kwargs(self, prompt, stream):
+        # Simplified build_kwargs to get caching options from prompt.options
+        kwargs = super().build_kwargs(prompt, stream)
+        extra_body = kwargs.get('extra_body', {}) # Capture existing extra_body
+
+        # Check ONLY for caching options in prompt.options
+        options = prompt.options # This is the Pydantic Options instance populated by llm from CLI
+
+        if hasattr(options, 'cache_mode') and options.cache_mode is not None:
+             extra_body['cache_mode'] = options.cache_mode
+        if hasattr(options, 'cache_max_age_seconds') and options.cache_max_age_seconds is not None:
+             try:
+                 extra_body['cache_max_age_seconds'] = int(options.cache_max_age_seconds)
+             except (ValueError, TypeError):
+                 print(f"Warning: Could not convert cache_max_age_seconds to int: {options.cache_max_age_seconds}", file=sys.stderr)
+
+
+        if extra_body:
+            kwargs['extra_body'] = extra_body
+        else:
+            kwargs.pop('extra_body', None)
+
+        # Keep debug prints - they are valuable
+        print("--- Debug: Contents of prompt.options ---", file=sys.stderr)
+        # Use vars() to inspect attributes if model_dump_json fails on this minimal Options
+        try:
+            print(options.model_dump_json(exclude_none=True), file=sys.stderr)
+        except Exception as e:
+            print(f"Could not dump prompt.options as JSON: {e}. Trying vars()", file=sys.stderr)
+            print(vars(options), file=sys.stderr)
+        print("--- End Debug: prompt.options ---", file=sys.stderr)
+        print("--- Debug: Contents of extra_body ---", file=sys.stderr)
+        print(json.dumps(extra_body), file=sys.stderr)
+        print("--- End Debug: extra_body ---", file=sys.stderr)
+
+
+        # Return standard kwargs structure for API call attempts
+        return kwargs
+
+
+# Define Chat and AsyncChat classes separately while inheriting the mixin
+# These are needed for register_models
+class OpenRouterChat(_mixin, Chat): # Inherit from Chat
+    needs_key = "openrouter"
+    key_env_var = "OPENROUTER_KEY"
+    # Use the Options class defined in _mixin
+    Options = _mixin.Options # Explicitly attach the Options class
+
+    def __str__(self):
+        return "OpenRouter: {}".format(self.model_id)
+
+
+class OpenRouterAsyncChat(_mixin, AsyncChat): # Inherit from AsyncChat
+    needs_key = "openrouter"
+    key_env_var = "OPENROUTER_KEY"
+    # Use the Options class defined in _mixin
+    Options = _mixin.Options # Explicitly attach the Options class
+
+    def __str__(self):
+        return "OpenRouter: {}".format(self.model_id)
+
+
+# Helper function to fetch models from OpenRouter API (essential for register_models)
+def get_openrouter_models():
+    # Minimal version - hardcoded models + placeholder helpers
+    pass # Placeholder - need to re-add fetch_cached_json and models list logic
+
+# Helper function for fetching and caching JSON (Needed for get_openrouter_models)
+def fetch_cached_json(url, path, cache_timeout):
+     # Placeholder, will cause errors later if reached
+     raise NotImplementedError("fetch_cached_json not implemented in minimal plugin")
+
+# Helper function to check for image support (Needed for get_openrouter_models)
+def get_supports_images(model_definition):
+     # Placeholder
+     return False
+
+@llm.hookimpl
+def register_models(register):
+    # Only do this if the openrouter key is set
+    key = llm.get_key("", "openrouter", "OPENROUTER_KEY")
+    if not key:
+        return
+
+    # Minimal hardcoded models for loadability testing
+    models_list = [
+         {"id": "anthropic/claude-3-haiku", "name": "Claude 3 Haiku", "context_length": 200000, "supports_schema": False, "pricing": {}},
+         {"id": "google/gemini-pro-1.5", "name": "Gemini 1.5 Pro", "context_length": 1000000, "supports_schema": True, "pricing": {}}
+    ]
+
+
+    # Register models using the minimal hardcoded list
+    for model_definition in models_list:
+        kwargs = dict(
+            model_id="openrouter/{}".format(model_definition["id"]),
+            model_name=model_definition["id"],
+            vision=False, # Simplified
+            supports_schema=model_definition["supports_schema"],
+            api_base="https://openrouter.ai/api/v1",
+            headers={"HTTP-Referer": "https://llm.datasette.io/", "X-Title": "LLM"},
+        )
+
+        chat_model = OpenRouterChat(**kwargs)
+        async_chat_model = OpenRouterAsyncChat(**kwargs)
+        register(
+            chat_model,
+            async_chat_model,
+        )
+
+# Exclude register_commands hook for this caching-only implementation
+
