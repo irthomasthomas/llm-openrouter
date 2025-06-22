@@ -126,6 +126,15 @@ llm -m openrouter/meta-llama/llama-3.1-8b-instruct hi \
 This specifies that you would like only providers that [support fp8 quantization](https://openrouter.ai/docs/features/provider-routing#example-requesting-fp8-quantization) for that model.
 
 ### Incorporating search results from Exa
+### Internal reasoning
+
+Some OpenRouter models perform internal reasoning steps before generating a final answer. You can control the maximum number of reasoning steps (or tokens) the model is allowed to use.
+
+Use the `-o reasoning_max_tokens <integer>` option to set this limit. For example, to allocate a maximum of 2,000 reasoning tokens:
+
+```bash
+llm -m openrouter/anthropic/claude-3-opus -o reasoning_max_tokens 2000 \
+  'Explain the theory of relativity as if to a curious 12-year-old.'
 
 OpenRouter have [a partnership](https://openrouter.ai/docs/features/web-search) with [Exa](https://exa.ai/) where prompts through _any_ supported model can be augmented with relevant search results from the Exa index - a form of RAG.
 

@@ -39,6 +39,10 @@ class _mixin:
             description=("JSON object to control provider routing"),
             default=None,
         )
+        reasoning_max_tokens: Optional[int] = Field(
+            description="Set max tokens for reasoning allocation",
+            default=None,
+        )
 
         @field_validator("provider")
         def validate_provider(cls, provider):
@@ -56,16 +60,17 @@ class _mixin:
         kwargs = super().build_kwargs(prompt, stream)
         kwargs.pop("provider", None)
         kwargs.pop("online", None)
+        kwargs.pop("reasoning_max_tokens", None) # Pop the new option
         extra_body = {}
         if prompt.options.online:
             extra_body["plugins"] = [{"id": "web"}]
         if prompt.options.provider:
             extra_body["provider"] = prompt.options.provider
+        if prompt.options.reasoning_max_tokens is not None: # Add logic for reasoning_max_tokens
+            extra_body["reasoning"] = {"max_tokens": prompt.options.reasoning_max_tokens}
         if extra_body:
             kwargs["extra_body"] = extra_body
         return kwargs
-
-
 class OpenRouterChat(_mixin, Chat):
     needs_key = "openrouter"
     key_env_var = "OPENROUTER_KEY"
