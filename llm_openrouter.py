@@ -60,13 +60,13 @@ class _mixin:
         kwargs = super().build_kwargs(prompt, stream)
         kwargs.pop("provider", None)
         kwargs.pop("online", None)
-        kwargs.pop("reasoning_max_tokens", None) # Pop the new option
+        kwargs.pop("reasoning_max_tokens", None)
         extra_body = {}
         if prompt.options.online:
             extra_body["plugins"] = [{"id": "web"}]
         if prompt.options.provider:
             extra_body["provider"] = prompt.options.provider
-        if prompt.options.reasoning_max_tokens is not None: # Add logic for reasoning_max_tokens
+        if prompt.options.reasoning_max_tokens is not None:
             extra_body["reasoning"] = {"max_tokens": prompt.options.reasoning_max_tokens}
         if extra_body:
             kwargs["extra_body"] = extra_body
